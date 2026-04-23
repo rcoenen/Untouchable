@@ -4,7 +4,7 @@ set -euo pipefail
 APP="Untouchable.app"
 BIN="Untouchable"
 BUNDLE="$APP/Contents"
-DFR="/System/Library/PrivateFrameworks/DFRFoundation.framework"
+INSTALL_DIR="/Applications"
 
 rm -rf "$APP"
 mkdir -p "$BUNDLE/MacOS" "$BUNDLE/Resources"
@@ -23,5 +23,16 @@ codesign --force --sign - "$APP"
 
 echo ""
 echo "Built $APP"
-echo "Run it:  open $APP"
-echo "Or:      ./$BUNDLE/MacOS/$BIN"
+
+if [[ "${1:-}" == "install" ]]; then
+    echo "Installing to $INSTALL_DIR …"
+    killall Untouchable 2>/dev/null || true
+    sleep 1
+    rm -rf "$INSTALL_DIR/$APP"
+    cp -R "$APP" "$INSTALL_DIR/"
+    open "$INSTALL_DIR/$APP"
+    echo "Installed and relaunched from $INSTALL_DIR/$APP"
+else
+    echo "Run it:   open $APP"
+    echo "Install:  ./build.sh install"
+fi

@@ -178,6 +178,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let weather = WeatherClient()
     var weatherTimer: Timer?
     var clockTimer: Timer?
+    var presentTimer: Timer?
+    var enabled = false
+    var toggleItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ note: Notification) {
         // Menu bar icon
@@ -187,29 +190,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             btn.toolTip = "Untouchable — your Touch Bar, silenced"
         }
         let menu = NSMenu()
+        toggleItem = NSMenuItem(title: "Disable", action: #selector(toggle), keyEquivalent: "d")
+        menu.addItem(toggleItem)
         menu.addItem(NSMenuItem(title: "Refresh Weather", action: #selector(refresh), keyEquivalent: "r"))
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit Untouchable", action: #selector(quit), keyEquivalent: "q"))
         statusItem.menu = menu
 
-        // Take over the Touch Bar
-        DFRSetStatus(2)
-        NSLog("Untouchable: DFRSetStatus(2) called")
-
-        // ORDER MATTERS (per MTMR):
-        // 1. Register a system-tray item with our identifier
-        // 2. Call DFRSystemModalShowsCloseBoxWhenFrontMost(false)
-        // 3. Present the modal bar, passing that same identifier as systemTrayItemIdentifier
+        // One-time tray-slot registration (replaces the close-box X)
         ControlStrip.register()
-        DFR.showCloseBox?(false)
-        NSApp.activate(ignoringOtherApps: true)
-        GlobalTouchBar.present(bar.bar)
 
-        // Keep shoving the bar — if the user taps the (X) dismiss, we re-present fast.
-        Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            GlobalTouchBar.present(self.bar.bar)
-        }
+        enable()
 
         // Timers
         bar.tickClock()
@@ -228,6 +219,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func refresh() {
         weather.fetch { [weak self] w in self?.bar.setWeather(w) }
+    }
+
+    @objc func toggle() {
+        if enabled { disable() } else { enable() }
+    }
+
+    func enable() {
+        DFRSetStatus(2)
+        DFR.showCloseBox?(false)
+        NSApp.activate(ignoringOtherApps: true)
+        GlobalTouchBar.present(bar.bar)
+        presentTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            GlobalTouchBar.present(self.bar.bar)
+        }
+        enabled = true
+        toggleItem.title = "Disable"
+        statusItem.button?.title = "∅"
+        NSLog("Untouchable: ENABLED")
+    }
+
+    func disable() {
+        presentTimer?.invalidate()
+        presentTimer = nil
+        DFRSetStatus(0) // hand the default strip back
+        enabled = false
+        toggleItem.title = "Enable"
+        statusItem.button?.title = "⊘"
+        NSLog("Untouchable: DISABLED")
     }
 
     @objc func quit() { NSApp.terminate(nil) }
