@@ -1,0 +1,4 @@
+Untouchable.app/
+.DS_Store
+*.dSYM/
+build/
