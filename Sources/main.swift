@@ -1,4 +1,5 @@
 import Cocoa
+import CoreAudio
 
 // MARK: - DFRFoundation private framework bridge
 
@@ -129,20 +130,326 @@ final class WeatherClient {
     }
 }
 
+// MARK: - HID aux keys (same path as F1/F2/mute/vol)
+
+enum AuxKey {
+    // NX_KEYTYPE constants
+    static let soundUp: Int32 = 0
+    static let soundDown: Int32 = 1
+    static let brightnessUp: Int32 = 2
+    static let brightnessDown: Int32 = 3
+    static let mute: Int32 = 7
+    static let illumUp: Int32 = 21
+    static let illumDown: Int32 = 22
+
+    static func post(_ key: Int32) {
+        send(key, down: true)
+        send(key, down: false)
+    }
+
+    // Some aux keys (keyboard illumination) are only honored on the session tap.
+    // Post to both to cover all cases.
+    static func postAll(_ key: Int32) {
+        send(key, down: true, taps: [.cghidEventTap, .cgSessionEventTap, .cgAnnotatedSessionEventTap])
+        send(key, down: false, taps: [.cghidEventTap, .cgSessionEventTap, .cgAnnotatedSessionEventTap])
+    }
+
+    private static func send(_ key: Int32, down: Bool, taps: [CGEventTapLocation] = [.cghidEventTap]) {
+        let flagsRaw: UInt = down ? 0xa00 : 0xb00
+        let data1 = (Int(key) << 16) | ((down ? 0xa : 0xb) << 8)
+        guard let ev = NSEvent.otherEvent(
+            with: .systemDefined,
+            location: .zero,
+            modifierFlags: NSEvent.ModifierFlags(rawValue: flagsRaw),
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            subtype: 8,
+            data1: data1,
+            data2: -1
+        ), let cg = ev.cgEvent else { return }
+        for tap in taps { cg.post(tap: tap) }
+    }
+}
+
+// MARK: - Display brightness via DisplayServices (private)
+
+enum DisplayBrightness {
+    private static let handle: UnsafeMutableRawPointer? = dlopen(
+        "/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices", RTLD_NOW)
+
+    private static let getFn: (@convention(c) (UInt32, UnsafeMutablePointer<Float>) -> Int32)? = {
+        guard let h = handle, let s = dlsym(h, "DisplayServicesGetBrightness") else { return nil }
+        return unsafeBitCast(s, to: (@convention(c) (UInt32, UnsafeMutablePointer<Float>) -> Int32).self)
+    }()
+
+    private static let setFn: (@convention(c) (UInt32, Float) -> Int32)? = {
+        guard let h = handle, let s = dlsym(h, "DisplayServicesSetBrightness") else { return nil }
+        return unsafeBitCast(s, to: (@convention(c) (UInt32, Float) -> Int32).self)
+    }()
+
+    static func level() -> Float? {
+        guard let g = getFn else { return nil }
+        var v: Float = 0
+        return g(CGMainDisplayID(), &v) == 0 ? v : nil
+    }
+
+    static func setLevel(_ v: Float) {
+        guard let s = setFn else { return }
+        _ = s(CGMainDisplayID(), max(0, min(1, v)))
+    }
+
+    static func step(_ delta: Float) {
+        let cur = level() ?? 0.5
+        setLevel(cur + delta)
+    }
+}
+
+// MARK: - Keyboard backlight via CoreBrightness (private)
+//
+// On macOS 26 (Tahoe), the API is:
+//   -[KeyboardBrightnessClient copyKeyboardBacklightIDs]  -> NSArray<NSNumber*>
+//   -[KeyboardBrightnessClient brightnessForKeyboard:(uint64_t)]  -> float
+//   -[KeyboardBrightnessClient setBrightness:(float) forKeyboard:(uint64_t)]  -> BOOL
+
+enum KeyboardBacklight {
+    private static let clientClass: AnyClass? = {
+        _ = dlopen("/System/Library/PrivateFrameworks/CoreBrightness.framework/CoreBrightness", RTLD_NOW)
+        let cls: AnyClass? = NSClassFromString("KeyboardBrightnessClient")
+        if cls == nil { NSLog("Untouchable: KeyboardBrightnessClient class not found") }
+        return cls
+    }()
+
+    private static let client: NSObject? = {
+        guard let cls = clientClass as? NSObject.Type else { return nil }
+        return cls.init()
+    }()
+
+    private static func imp<T>(_ selName: String, as type: T.Type) -> T? {
+        guard let cls = clientClass,
+              let m = class_getInstanceMethod(cls, NSSelectorFromString(selName))
+        else {
+            NSLog("Untouchable: missing method \(selName)")
+            return nil
+        }
+        return unsafeBitCast(method_getImplementation(m), to: T.self)
+    }
+
+    private static let copyIdsImp: (@convention(c) (AnyObject, Selector) -> NSArray?)?
+        = imp("copyKeyboardBacklightIDs", as: (@convention(c) (AnyObject, Selector) -> NSArray?).self)
+
+    private static let getImp: (@convention(c) (AnyObject, Selector, UInt64) -> Float)?
+        = imp("brightnessForKeyboard:", as: (@convention(c) (AnyObject, Selector, UInt64) -> Float).self)
+
+    private static let setImp: (@convention(c) (AnyObject, Selector, Float, UInt64) -> Bool)?
+        = imp("setBrightness:forKeyboard:", as: (@convention(c) (AnyObject, Selector, Float, UInt64) -> Bool).self)
+
+    // First keyboard ID (usually the built-in). Re-queried each call in case devices change.
+    private static func currentKeyboardID() -> UInt64? {
+        guard let c = client, let copy = copyIdsImp else { return nil }
+        let arr = copy(c, NSSelectorFromString("copyKeyboardBacklightIDs"))
+        guard let first = arr?.firstObject as? NSNumber else {
+            NSLog("Untouchable: no keyboard backlight IDs found")
+            return nil
+        }
+        return first.uint64Value
+    }
+
+    static func level() -> Float? {
+        guard let c = client, let g = getImp, let id = currentKeyboardID() else { return nil }
+        return g(c, NSSelectorFromString("brightnessForKeyboard:"), id)
+    }
+
+    static func setLevel(_ v: Float) {
+        guard let c = client, let s = setImp, let id = currentKeyboardID() else { return }
+        let clamped = max(0, min(1, v))
+        let ok = s(c, NSSelectorFromString("setBrightness:forKeyboard:"), clamped, id)
+        NSLog("Untouchable: kbd backlight -> \(clamped) ok=\(ok)")
+    }
+
+    static func step(_ delta: Float) {
+        let cur = level() ?? 0.5
+        setLevel(cur + delta)
+    }
+}
+
+// MARK: - System volume via CoreAudio
+
+enum SystemVolume {
+    private static var defaultOutputDevice: AudioDeviceID? {
+        var id = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        let status = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &id)
+        return status == noErr ? id : nil
+    }
+
+    static func get() -> Float? {
+        guard let dev = defaultOutputDevice else { return nil }
+        var vol = Float32(0)
+        var size = UInt32(MemoryLayout<Float32>.size)
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyVolumeScalar,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain)
+        if AudioObjectHasProperty(dev, &addr),
+           AudioObjectGetPropertyData(dev, &addr, 0, nil, &size, &vol) == noErr {
+            return vol
+        }
+        // Fall back to per-channel average (L + R)
+        var l = Float32(0), r = Float32(0)
+        var s1 = UInt32(MemoryLayout<Float32>.size)
+        var s2 = UInt32(MemoryLayout<Float32>.size)
+        addr.mElement = 1
+        let rL = AudioObjectGetPropertyData(dev, &addr, 0, nil, &s1, &l)
+        addr.mElement = 2
+        let rR = AudioObjectGetPropertyData(dev, &addr, 0, nil, &s2, &r)
+        if rL == noErr && rR == noErr { return (l + r) / 2 }
+        return nil
+    }
+
+    static func set(_ v: Float) {
+        guard let dev = defaultOutputDevice else { return }
+        var vol = Float32(max(0, min(1, v)))
+        let size = UInt32(MemoryLayout<Float32>.size)
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyVolumeScalar,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain)
+        if AudioObjectHasProperty(dev, &addr) {
+            AudioObjectSetPropertyData(dev, &addr, 0, nil, size, &vol)
+            return
+        }
+        addr.mElement = 1
+        AudioObjectSetPropertyData(dev, &addr, 0, nil, size, &vol)
+        addr.mElement = 2
+        AudioObjectSetPropertyData(dev, &addr, 0, nil, size, &vol)
+    }
+
+    private static var preMuteVolume: Float?
+
+    private static func muteAddr() -> AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyMute,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain)
+    }
+
+    static func isMuted() -> Bool {
+        guard let dev = defaultOutputDevice else { return false }
+        var addr = muteAddr()
+        if AudioObjectHasProperty(dev, &addr) {
+            var cur = UInt32(0)
+            var size = UInt32(MemoryLayout<UInt32>.size)
+            if AudioObjectGetPropertyData(dev, &addr, 0, nil, &size, &cur) == noErr {
+                return cur != 0
+            }
+        }
+        return (get() ?? 1) < 0.001
+    }
+
+    static func toggleMute() {
+        guard let dev = defaultOutputDevice else { return }
+        var addr = muteAddr()
+        if AudioObjectHasProperty(dev, &addr) {
+            var cur = UInt32(0)
+            var size = UInt32(MemoryLayout<UInt32>.size)
+            if AudioObjectGetPropertyData(dev, &addr, 0, nil, &size, &cur) == noErr {
+                var next: UInt32 = cur == 0 ? 1 : 0
+                AudioObjectSetPropertyData(dev, &addr, 0, nil, size, &next)
+                return
+            }
+        }
+        // Fallback: no hardware mute (common with AirPods, etc.) — drop volume to 0 and restore.
+        if let cur = get(), cur > 0.001 {
+            preMuteVolume = cur
+            set(0)
+        } else {
+            set(preMuteVolume ?? 0.5)
+            preMuteVolume = nil
+        }
+    }
+}
+
+// MARK: - Press-and-hold auto-repeat
+//
+// NSButton on the Touch Bar does NOT receive mouseDown/mouseUp — it receives
+// direct touches via touchesBegan/touchesEnded (NSResponder). Timers must be
+// scheduled in .eventTracking mode because Touch Bar touches block the default
+// run loop mode. Pattern from MTMR's CustomButtonTouchBarItem.
+
+final class HoldButton: NSButton {
+    var onFire: (() -> Void)?
+    private var repeatTimer: Timer?
+
+    override func touchesBegan(with event: NSEvent) {
+        super.touchesBegan(with: event)
+        onFire?()
+        let delay = Timer(timeInterval: NSEvent.keyRepeatDelay, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            let repeater = Timer(timeInterval: NSEvent.keyRepeatInterval, repeats: true) { [weak self] _ in
+                self?.onFire?()
+            }
+            RunLoop.main.add(repeater, forMode: .eventTracking)
+            RunLoop.main.add(repeater, forMode: .default)
+            self.repeatTimer = repeater
+        }
+        RunLoop.main.add(delay, forMode: .eventTracking)
+        RunLoop.main.add(delay, forMode: .default)
+        repeatTimer = delay
+    }
+
+    override func touchesEnded(with event: NSEvent) {
+        super.touchesEnded(with: event)
+        repeatTimer?.invalidate()
+        repeatTimer = nil
+    }
+
+    override func touchesCancelled(with event: NSEvent) {
+        super.touchesCancelled(with: event)
+        repeatTimer?.invalidate()
+        repeatTimer = nil
+    }
+}
+
 // MARK: - Touch Bar
 
 final class UntouchableBar: NSObject, NSTouchBarDelegate {
     static let weatherId = NSTouchBarItem.Identifier("com.untouchable.weather")
     static let clockId = NSTouchBarItem.Identifier("com.untouchable.clock")
+    static let muteId = NSTouchBarItem.Identifier("com.untouchable.mute")
+    static let volumeId = NSTouchBarItem.Identifier("com.untouchable.volume")
+    static let kbdDownId = NSTouchBarItem.Identifier("com.untouchable.kbddown")
+    static let kbdUpId = NSTouchBarItem.Identifier("com.untouchable.kbdup")
+    static let brightDownId = NSTouchBarItem.Identifier("com.untouchable.brightdown")
+    static let brightUpId = NSTouchBarItem.Identifier("com.untouchable.brightup")
 
     let bar = NSTouchBar()
     let weatherLabel = NSTextField(labelWithString: "… loading")
     let clockLabel = NSTextField(labelWithString: "--:--")
+    weak var volumeSlider: NSSlider?
+    weak var muteButton: NSButton?
 
     override init() {
         super.init()
         bar.delegate = self
-        bar.defaultItemIdentifiers = [.flexibleSpace, Self.weatherId, .fixedSpaceLarge, Self.clockId, .flexibleSpace]
+        bar.defaultItemIdentifiers = [
+            Self.weatherId,
+            .fixedSpaceLarge,
+            Self.clockId,
+            .flexibleSpace,
+            Self.muteId,
+            Self.volumeId,
+            .fixedSpaceSmall,
+            Self.kbdDownId,
+            Self.kbdUpId,
+            Self.brightDownId,
+            Self.brightUpId,
+        ]
         weatherLabel.font = .systemFont(ofSize: 18, weight: .medium)
         weatherLabel.textColor = .white
         clockLabel.font = .monospacedDigitSystemFont(ofSize: 18, weight: .medium)
@@ -150,13 +457,91 @@ final class UntouchableBar: NSObject, NSTouchBarDelegate {
     }
 
     func touchBar(_ touchBar: NSTouchBar, makeItemForIdentifier id: NSTouchBarItem.Identifier) -> NSTouchBarItem? {
-        let item = NSCustomTouchBarItem(identifier: id)
         switch id {
-        case Self.weatherId: item.view = weatherLabel
-        case Self.clockId: item.view = clockLabel
-        default: return nil
+        case Self.weatherId:
+            let item = NSCustomTouchBarItem(identifier: id)
+            item.view = weatherLabel
+            return item
+        case Self.clockId:
+            let item = NSCustomTouchBarItem(identifier: id)
+            item.view = clockLabel
+            return item
+        case Self.brightDownId:
+            return repeatingIconButton(id: id, symbol: "sun.min", fire: { [weak self] in self?.brightDown() }, label: "Brightness down")
+        case Self.brightUpId:
+            return repeatingIconButton(id: id, symbol: "sun.max", fire: { [weak self] in self?.brightUp() }, label: "Brightness up")
+        case Self.kbdDownId:
+            return repeatingIconButton(id: id, symbol: "light.min", fire: { [weak self] in self?.kbdDown() }, label: "Keyboard light down")
+        case Self.kbdUpId:
+            return repeatingIconButton(id: id, symbol: "light.max", fire: { [weak self] in self?.kbdUp() }, label: "Keyboard light up")
+        case Self.muteId:
+            let item = iconButton(id: id, symbol: "speaker.wave.2.fill", action: #selector(muteToggle), label: "Mute")
+            if let btn = (item as? NSCustomTouchBarItem)?.view as? NSButton { muteButton = btn }
+            refreshMuteIcon()
+            return item
+        case Self.volumeId:
+            let item = NSCustomTouchBarItem(identifier: id)
+            let slider = NSSlider(value: Double(SystemVolume.get() ?? 0.5),
+                                  minValue: 0, maxValue: 1,
+                                  target: self, action: #selector(volumeChanged(_:)))
+            slider.translatesAutoresizingMaskIntoConstraints = false
+            slider.widthAnchor.constraint(equalToConstant: 100).isActive = true
+            item.view = slider
+            volumeSlider = slider
+            return item
+        default:
+            return nil
         }
+    }
+
+    private func iconButton(id: NSTouchBarItem.Identifier, symbol: String, action: Selector, label: String) -> NSTouchBarItem {
+        let item = NSCustomTouchBarItem(identifier: id)
+        let img = NSImage(systemSymbolName: symbol, accessibilityDescription: label)
+        let btn = NSButton(title: "", target: self, action: action)
+        btn.image = img
+        btn.bezelStyle = .rounded
+        btn.imageScaling = .scaleProportionallyDown
+        item.view = btn
         return item
+    }
+
+    private func repeatingIconButton(id: NSTouchBarItem.Identifier, symbol: String, fire: @escaping () -> Void, label: String) -> NSTouchBarItem {
+        let item = NSCustomTouchBarItem(identifier: id)
+        // Using the convenience init ensures the cell + image position are fully set up.
+        // target/action stay nil — onFire is what actually runs.
+        let btn = HoldButton(title: "", target: nil, action: nil)
+        btn.image = NSImage(systemSymbolName: symbol, accessibilityDescription: label)
+        btn.bezelStyle = .rounded
+        btn.imageScaling = .scaleProportionallyDown
+        btn.onFire = fire
+        item.view = btn
+        return item
+    }
+
+    func refreshVolumeSlider() {
+        guard let s = volumeSlider, let v = SystemVolume.get() else { return }
+        s.doubleValue = Double(v)
+    }
+
+    func refreshMuteIcon() {
+        guard let btn = muteButton else { return }
+        let vol = SystemVolume.get() ?? 1
+        let muted = SystemVolume.isMuted() || vol < 0.001
+        let name = muted ? "speaker.slash.fill" : "speaker.wave.2.fill"
+        btn.image = NSImage(systemSymbolName: name, accessibilityDescription: "Mute")
+    }
+
+    @objc func brightDown() { DisplayBrightness.step(-1.0/16) }
+    @objc func brightUp()   { DisplayBrightness.step(+1.0/16) }
+    @objc func kbdDown() { KeyboardBacklight.step(-1.0/16) }
+    @objc func kbdUp()   { KeyboardBacklight.step(+1.0/16) }
+    @objc func muteToggle() {
+        SystemVolume.toggleMute()
+        refreshMuteIcon()
+    }
+    @objc func volumeChanged(_ sender: NSSlider) {
+        SystemVolume.set(Float(sender.doubleValue))
+        refreshMuteIcon()
     }
 
     func setWeather(_ w: Weather?) {
@@ -206,6 +591,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         bar.tickClock()
         clockTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             self?.bar.tickClock()
+            self?.bar.refreshVolumeSlider()
+            self?.bar.refreshMuteIcon()
         }
         refresh()
         weatherTimer = Timer.scheduledTimer(withTimeInterval: 15 * 60, repeats: true) { [weak self] _ in
